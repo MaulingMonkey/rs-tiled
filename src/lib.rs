@@ -3,14 +3,29 @@ extern crate libflate;
 extern crate xml;
 
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{BufReader, Error, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use xml::attribute::OwnedAttribute;
 use xml::reader::XmlEvent;
 use xml::reader::{Error as XmlError, EventReader};
+
+/// Defines a series of types used for referencing images/tilesets/files.
+pub trait Context {
+    type ImageRef           : Debug + PartialEq + Clone + Eq;
+    type PropertyFileRef    : Debug + PartialEq + Clone;
+    type TilesetDataRef     : Debug + PartialEq + Clone;
+}
+
+/// Defines a means of resolving `.tmx`, `.ts`, etc. contents to concrete reference types.
+pub trait Factory<C : Context> {
+    fn image_ref(&self, path: String)                   -> Result<C::ImageRef, TiledError>;
+    fn external_tileset_ref(&self, path: PathBuf)       -> Result<C::TilesetDataRef, TiledError>;
+    fn embed_tileset(&self, embedded: TilesetData<C>)   -> Result<C::TilesetDataRef, TiledError>;
+    fn property_file_ref(&self, path: String)           -> Result<C::PropertyFileRef, TiledError>;
+}
 
 #[derive(Debug, Copy, Clone)]
 pub enum ParseTileError {
@@ -143,12 +158,12 @@ impl std::error::Error for TiledError {
             TiledError::Other(ref s) => s.as_ref(),
         }
     }
-    fn cause(&self) -> Option<&std::error::Error> {
+    fn cause(&self) -> Option<&dyn std::error::Error> {
         match *self {
             TiledError::MalformedAttributes(_) => None,
-            TiledError::DecompressingError(ref e) => Some(e as &std::error::Error),
-            TiledError::Base64DecodingError(ref e) => Some(e as &std::error::Error),
-            TiledError::XmlDecodingError(ref e) => Some(e as &std::error::Error),
+            TiledError::DecompressingError(ref e) => Some(e as &dyn std::error::Error),
+            TiledError::Base64DecodingError(ref e) => Some(e as &dyn std::error::Error),
+            TiledError::XmlDecodingError(ref e) => Some(e as &dyn std::error::Error),
             TiledError::PrematureEnd(_) => None,
             TiledError::Other(_) => None,
         }
@@ -156,16 +171,17 @@ impl std::error::Error for TiledError {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum PropertyValue {
+pub enum PropertyValue<C: Context = LegacyContext> {
     BoolValue(bool),
     FloatValue(f32),
     IntValue(i32),
     ColorValue(u32),
     StringValue(String),
+    FileValue(C::PropertyFileRef),
 }
 
-impl PropertyValue {
-    fn new(property_type: String, value: String) -> Result<PropertyValue, TiledError> {
+impl<C: Context> PropertyValue<C> {
+    fn new(factory: &impl Factory<C>, property_type: String, value: String) -> Result<Self, TiledError> {
         use std::error::Error;
 
         // Check the property type against the value.
@@ -189,6 +205,7 @@ impl PropertyValue {
                 ))),
             },
             "string" => Ok(PropertyValue::StringValue(value)),
+            "file" => Ok(PropertyValue::FileValue(factory.property_file_ref(value)?)),
             _ => Err(TiledError::Other(format!(
                 "Unknown property type \"{}\"",
                 property_type
@@ -197,9 +214,9 @@ impl PropertyValue {
     }
 }
 
-pub type Properties = HashMap<String, PropertyValue>;
+pub type Properties<C> = HashMap<String, PropertyValue<C>>;
 
-fn parse_properties<R: Read>(parser: &mut EventReader<R>) -> Result<Properties, TiledError> {
+fn parse_properties<C: Context, R: Read>(factory: &impl Factory<C>, parser: &mut EventReader<R>) -> Result<Properties<C>, TiledError> {
     let mut p = HashMap::new();
     parse_tag!(parser, "properties", {
         "property" => |attrs:Vec<OwnedAttribute>| {
@@ -216,37 +233,38 @@ fn parse_properties<R: Read>(parser: &mut EventReader<R>) -> Result<Properties, 
             );
             let t = t.unwrap_or("string".into());
 
-            p.insert(k, try!(PropertyValue::new(t, v)));
+            p.insert(k, PropertyValue::new(factory, t, v)?);
             Ok(())
         },
     });
     Ok(p)
 }
 
-/// All Tiled files will be parsed into this. Holds all the layers and tilesets
+/// Tiled `.tmx` files will be parsed into this.  Holds all the layers and tilesets.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Map {
+pub struct Map<C: Context = LegacyContext> {
     pub version: String,
     pub orientation: Orientation,
     pub width: u32,
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
-    pub tilesets: Vec<Tileset>,
-    pub layers: Vec<Layer>,
-    pub image_layers: Vec<ImageLayer>,
-    pub object_groups: Vec<ObjectGroup>,
-    pub properties: Properties,
+    pub tilesets: Vec<Tileset<C>>,
+    pub layers: Vec<Layer<C>>,
+    pub image_layers: Vec<ImageLayer<C>>,
+    pub object_groups: Vec<ObjectGroup<C>>,
+    pub properties: Properties<C>,
     pub background_colour: Option<Colour>,
 }
 
-impl Map {
+impl<C: Context> Map<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         map_path: Option<&Path>,
-    ) -> Result<Map, TiledError> {
-        let (c, (v, o, w, h, tw, th)) = get_attrs!(
+    ) -> Result<Self, TiledError> {
+        let (background_colour, (version, orientation, width, height, tile_width, tile_height)) = get_attrs!(
             attrs,
             optionals: [
                 ("backgroundcolor", colour, |v:String| v.parse().ok()),
@@ -270,47 +288,47 @@ impl Map {
         let mut layer_index = 0;
         parse_tag!(parser, "map", {
             "tileset" => | attrs| {
-                tilesets.push(try!(Tileset::new(parser, attrs, map_path)));
+                tilesets.push(Tileset::new(factory, parser, attrs, map_path)?);
                 Ok(())
             },
             "layer" => |attrs| {
-                layers.push(try!(Layer::new(parser, attrs, w, layer_index)));
+                layers.push(Layer::new(factory, parser, attrs, width, layer_index)?);
                 layer_index += 1;
                 Ok(())
             },
             "imagelayer" => |attrs| {
-                image_layers.push(try!(ImageLayer::new(parser, attrs, layer_index)));
+                image_layers.push(ImageLayer::new(factory, parser, attrs, layer_index)?);
                 layer_index += 1;
                 Ok(())
             },
             "properties" => |_| {
-                properties = try!(parse_properties(parser));
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
             "objectgroup" => |attrs| {
-                object_groups.push(try!(ObjectGroup::new(parser, attrs, Some(layer_index))));
+                object_groups.push(ObjectGroup::new(factory, parser, attrs, Some(layer_index))?);
                 layer_index += 1;
                 Ok(())
             },
         });
         Ok(Map {
-            version: v,
-            orientation: o,
-            width: w,
-            height: h,
-            tile_width: tw,
-            tile_height: th,
+            version,
+            orientation,
+            width,
+            height,
+            tile_width,
+            tile_height,
             tilesets,
             layers,
             image_layers,
             object_groups,
             properties,
-            background_colour: c,
+            background_colour,
         })
     }
 
     /// This function will return the correct Tileset given a GID.
-    pub fn get_tileset_by_gid(&self, gid: u32) -> Option<&Tileset> {
+    pub fn get_tileset_by_gid(&self, gid: u32) -> Option<&Tileset<C>> {
         let mut maximum_gid: i32 = -1;
         let mut maximum_ts = None;
         for tileset in self.tilesets.iter() {
@@ -347,9 +365,25 @@ impl FromStr for Orientation {
 
 /// A tileset, usually the tilesheet image.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Tileset {
+pub struct Tileset<C: Context = LegacyContext> {
     /// The GID of the first tile stored
     pub first_gid: u32,
+    pub data: C::TilesetDataRef
+}
+
+// TilesetData used to be part of Tileset... deref for some backwards compatability
+impl<C: Context> std::ops::Deref for Tileset<C> {
+    type Target = C::TilesetDataRef;
+    fn deref(&self) -> &Self::Target { &self.data }
+}
+
+impl<C: Context> std::ops::DerefMut for Tileset<C> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.data }
+}
+
+/// Tiled `.ts` files, or embedded tilesets, will be parsed into this.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TilesetData<C: Context = LegacyContext> {
     pub name: String,
     pub tile_width: u32,
     pub tile_height: u32,
@@ -357,24 +391,26 @@ pub struct Tileset {
     pub margin: u32,
     /// The Tiled spec says that a tileset can have mutliple images so a `Vec`
     /// is used. Usually you will only use one.
-    pub images: Vec<Image>,
-    pub tiles: Vec<Tile>,
+    pub images: Vec<Image<C>>,
+    pub tiles: Vec<Tile<C>>,
 }
 
-impl Tileset {
+impl<C: Context> Tileset<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         map_path: Option<&Path>,
-    ) -> Result<Tileset, TiledError> {
-        Tileset::new_internal(parser, &attrs).or_else(|_| Tileset::new_reference(&attrs, map_path))
+    ) -> Result<Self, TiledError> {
+        Self::new_internal(factory, parser, &attrs).or_else(|_| Self::new_reference(factory, &attrs, map_path))
     }
 
     fn new_internal<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: &Vec<OwnedAttribute>,
-    ) -> Result<Tileset, TiledError> {
-        let ((spacing, margin), (first_gid, name, width, height)) = get_attrs!(
+    ) -> Result<Self, TiledError> {
+        let ((spacing, margin), (first_gid, name, tile_width, tile_height)) = get_attrs!(
            attrs,
            optionals: [
                 ("spacing", spacing, |v:String| v.parse().ok()),
@@ -383,8 +419,8 @@ impl Tileset {
            required: [
                 ("firstgid", first_gid, |v:String| v.parse().ok()),
                 ("name", name, |v| Some(v)),
-                ("tilewidth", width, |v:String| v.parse().ok()),
-                ("tileheight", height, |v:String| v.parse().ok()),
+                ("tilewidth", tile_width, |v:String| v.parse().ok()),
+                ("tileheight", tile_height, |v:String| v.parse().ok()),
             ],
             TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
         );
@@ -393,31 +429,35 @@ impl Tileset {
         let mut tiles = Vec::new();
         parse_tag!(parser, "tileset", {
             "image" => |attrs| {
-                images.push(try!(Image::new(parser, attrs)));
+                // XXX: Resolve relative to tileset path?
+                images.push(Image::new(factory, parser, attrs)?);
                 Ok(())
             },
             "tile" => |attrs| {
-                tiles.push(try!(Tile::new(parser, attrs)));
+                tiles.push(Tile::new(factory, parser, attrs)?);
                 Ok(())
             },
         });
 
-        Ok(Tileset {
+        Ok(Self {
             first_gid: first_gid,
-            name: name,
-            tile_width: width,
-            tile_height: height,
-            spacing: spacing.unwrap_or(0),
-            margin: margin.unwrap_or(0),
-            images: images,
-            tiles: tiles,
+            data: factory.embed_tileset(TilesetData{
+                name,
+                tile_width,
+                tile_height,
+                spacing: spacing.unwrap_or(0),
+                margin: margin.unwrap_or(0),
+                images,
+                tiles,
+            })?,
         })
     }
 
     fn new_reference(
+        factory: &impl Factory<C>,
         attrs: &Vec<OwnedAttribute>,
         map_path: Option<&Path>,
-    ) -> Result<Tileset, TiledError> {
+    ) -> Result<Self, TiledError> {
         let ((), (first_gid, source)) = get_attrs!(
             attrs,
             optionals: [],
@@ -429,16 +469,15 @@ impl Tileset {
         );
 
         let tileset_path = map_path.ok_or(TiledError::Other("Maps with external tilesets must know their file location.  See parse_with_path(Path).".to_string()))?.with_file_name(source);
-        let file = File::open(&tileset_path).map_err(|_| {
-            TiledError::Other(format!(
-                "External tileset file not found: {:?}",
-                tileset_path
-            ))
-        })?;
-        Tileset::new_external(file, first_gid)
+        Ok(Self{
+            first_gid,
+            data: factory.external_tileset_ref(tileset_path)?
+        })
     }
+}
 
-    fn new_external<R: Read>(file: R, first_gid: u32) -> Result<Tileset, TiledError> {
+impl<C: Context> TilesetData<C> {
+    fn new_external(factory: &impl Factory<C>, file: impl Read) -> Result<Self, TiledError> {
         let mut tileset_parser = EventReader::new(file);
         loop {
             match try!(tileset_parser.next().map_err(TiledError::XmlDecodingError)) {
@@ -446,8 +485,8 @@ impl Tileset {
                     name, attributes, ..
                 } => {
                     if name.local_name == "tileset" {
-                        return Tileset::parse_external_tileset(
-                            first_gid,
+                        return Self::parse_external_tileset(
+                            factory,
                             &mut tileset_parser,
                             &attributes,
                         );
@@ -464,11 +503,11 @@ impl Tileset {
     }
 
     fn parse_external_tileset<R: Read>(
-        first_gid: u32,
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: &Vec<OwnedAttribute>,
-    ) -> Result<Tileset, TiledError> {
-        let ((spacing, margin), (name, width, height)) = get_attrs!(
+    ) -> Result<Self, TiledError> {
+        let ((spacing, margin), (name, tile_width, tile_height)) = get_attrs!(
             attrs,
             optionals: [
                 ("spacing", spacing, |v:String| v.parse().ok()),
@@ -476,8 +515,8 @@ impl Tileset {
             ],
             required: [
                 ("name", name, |v| Some(v)),
-                ("tilewidth", width, |v:String| v.parse().ok()),
-                ("tileheight", height, |v:String| v.parse().ok()),
+                ("tilewidth", tile_width, |v:String| v.parse().ok()),
+                ("tileheight", tile_height, |v:String| v.parse().ok()),
             ],
             TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
         );
@@ -486,36 +525,35 @@ impl Tileset {
         let mut tiles = Vec::new();
         parse_tag!(parser, "tileset", {
             "image" => |attrs| {
-                images.push(try!(Image::new(parser, attrs)));
+                images.push(Image::new(factory, parser, attrs)?);
                 Ok(())
             },
             "tile" => |attrs| {
-                tiles.push(try!(Tile::new(parser, attrs)));
+                tiles.push(Tile::new(factory, parser, attrs)?);
                 Ok(())
             },
         });
 
-        Ok(Tileset {
-            first_gid: first_gid,
-            name: name,
-            tile_width: width,
-            tile_height: height,
+        Ok(Self {
+            name,
+            tile_width,
+            tile_height,
             spacing: spacing.unwrap_or(0),
             margin: margin.unwrap_or(0),
-            images: images,
-            tiles: tiles,
+            images,
+            tiles,
         })
     }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Tile {
+pub struct Tile<C: Context = LegacyContext> {
     pub id: u32,
     pub flip_h: bool,
     pub flip_v: bool,
-    pub images: Vec<Image>,
-    pub properties: Properties,
-    pub objectgroup: Option<ObjectGroup>,
+    pub images: Vec<Image<C>>,
+    pub properties: Properties<C>,
+    pub objectgroup: Option<ObjectGroup<C>>,
     pub animation: Option<Vec<Frame>>,
     pub tile_type: Option<String>,
     pub probability: f32,
@@ -527,11 +565,12 @@ const FLIPPED_DIAGONALLY_FLAG: u32 = 0x2;
 const ALL_FLIP_FLAGS: u32 =
     FLIPPED_HORIZONTALLY_FLAG | FLIPPED_VERTICALLY_FLAG | FLIPPED_DIAGONALLY_FLAG;
 
-impl Tile {
+impl<C: Context> Tile<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
-    ) -> Result<Tile, TiledError> {
+    ) -> Result<Tile<C>, TiledError> {
         let ((tile_type, probability), id) = get_attrs!(
             attrs,
             optionals: [
@@ -556,15 +595,15 @@ impl Tile {
         let mut animation = None;
         parse_tag!(parser, "tile", {
             "image" => |attrs| {
-                images.push(Image::new(parser, attrs)?);
+                images.push(Image::new(factory, parser, attrs)?);
                 Ok(())
             },
             "properties" => |_| {
-                properties = parse_properties(parser)?;
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
             "objectgroup" => |attrs| {
-                objectgroup = Some(ObjectGroup::new(parser, attrs, None)?);
+                objectgroup = Some(ObjectGroup::new(factory, parser, attrs, None)?);
                 Ok(())
             },
             "animation" => |_| {
@@ -587,19 +626,20 @@ impl Tile {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Image {
+pub struct Image<C: Context = LegacyContext> {
     /// The filepath of the image
-    pub source: String,
+    pub source: C::ImageRef,
     pub width: i32,
     pub height: i32,
     pub transparent_colour: Option<Colour>,
 }
 
-impl Image {
+impl<C: Context> Image<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
-    ) -> Result<Image, TiledError> {
+    ) -> Result<Self, TiledError> {
         let (c, (s, w, h)) = get_attrs!(
             attrs,
             optionals: [
@@ -614,8 +654,8 @@ impl Image {
         );
 
         parse_tag!(parser, "image", { "" => |_| Ok(()) });
-        Ok(Image {
-            source: s,
+        Ok(Self {
+            source: factory.image_ref(s)?,
             width: w,
             height: h,
             transparent_colour: c,
@@ -624,24 +664,25 @@ impl Image {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Layer {
+pub struct Layer<C: Context = LegacyContext> {
     pub name: String,
     pub opacity: f32,
     pub visible: bool,
     /// The tiles are arranged in rows. Each tile is a number which can be used
     ///  to find which tileset it belongs to and can then be rendered.
     pub tiles: Vec<Vec<u32>>,
-    pub properties: Properties,
+    pub properties: Properties<C>,
     pub layer_index: u32,
 }
 
-impl Layer {
+impl<C: Context> Layer<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         width: u32,
         layer_index: u32,
-    ) -> Result<Layer, TiledError> {
+    ) -> Result<Self, TiledError> {
         let ((o, v), n) = get_attrs!(
             attrs,
             optionals: [
@@ -661,12 +702,12 @@ impl Layer {
                 Ok(())
             },
             "properties" => |_| {
-                properties = try!(parse_properties(parser));
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
         });
 
-        Ok(Layer {
+        Ok(Self {
             name: n,
             opacity: o.unwrap_or(1.0),
             visible: v.unwrap_or(true),
@@ -678,23 +719,24 @@ impl Layer {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct ImageLayer {
+pub struct ImageLayer<C: Context = LegacyContext> {
     pub name: String,
     pub opacity: f32,
     pub visible: bool,
     pub offset_x: f32,
     pub offset_y: f32,
-    pub image: Option<Image>,
-    pub properties: Properties,
+    pub image: Option<Image<C>>,
+    pub properties: Properties<C>,
     pub layer_index: u32,
 }
 
-impl ImageLayer {
+impl<C: Context> ImageLayer<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         layer_index: u32,
-    ) -> Result<ImageLayer, TiledError> {
+    ) -> Result<Self, TiledError> {
         let ((o, v, ox, oy), n) = get_attrs!(
             attrs,
             optionals: [
@@ -708,18 +750,18 @@ impl ImageLayer {
             ],
             TiledError::MalformedAttributes("layer must have a name".to_string()));
         let mut properties = HashMap::new();
-        let mut image: Option<Image> = None;
+        let mut image: Option<Image<C>> = None;
         parse_tag!(parser, "imagelayer", {
             "image" => |attrs| {
-                image = Some(Image::new(parser, attrs)?);
+                image = Some(Image::new(factory, parser, attrs)?);
                 Ok(())
             },
             "properties" => |_| {
-                properties = parse_properties(parser)?;
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
         });
-        Ok(ImageLayer {
+        Ok(Self {
             name: n,
             opacity: o.unwrap_or(1.0),
             visible: v.unwrap_or(true),
@@ -733,25 +775,26 @@ impl ImageLayer {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct ObjectGroup {
+pub struct ObjectGroup<C: Context = LegacyContext> {
     pub name: String,
     pub opacity: f32,
     pub visible: bool,
-    pub objects: Vec<Object>,
+    pub objects: Vec<Object<C>>,
     pub colour: Option<Colour>,
     /**
      * Layer index is not preset for tile collision boxes
      */
     pub layer_index: Option<u32>,
-    pub properties: Properties,
+    pub properties: Properties<C>,
 }
 
-impl ObjectGroup {
+impl<C: Context> ObjectGroup<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         layer_index: Option<u32>,
-    ) -> Result<ObjectGroup, TiledError> {
+    ) -> Result<Self, TiledError> {
         let ((o, v, c, n), ()) = get_attrs!(
             attrs,
             optionals: [
@@ -767,15 +810,15 @@ impl ObjectGroup {
         let mut properties = HashMap::new();
         parse_tag!(parser, "objectgroup", {
             "object" => |attrs| {
-                objects.push(try!(Object::new(parser, attrs)));
+                objects.push(Object::new(factory, parser, attrs)?);
                 Ok(())
             },
             "properties" => |_| {
-                properties = try!(parse_properties(parser));
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
         });
-        Ok(ObjectGroup {
+        Ok(Self {
             name: n.unwrap_or(String::new()),
             opacity: o.unwrap_or(1.0),
             visible: v.unwrap_or(true),
@@ -796,7 +839,7 @@ pub enum ObjectShape {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Object {
+pub struct Object<C: Context = LegacyContext> {
     pub id: u32,
     pub gid: u32,
     pub name: String,
@@ -806,14 +849,15 @@ pub struct Object {
     pub rotation: f32,
     pub visible: bool,
     pub shape: ObjectShape,
-    pub properties: Properties,
+    pub properties: Properties<C>,
 }
 
-impl Object {
+impl<C: Context> Object<C> {
     fn new<R: Read>(
+        factory: &impl Factory<C>,
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
-    ) -> Result<Object, TiledError> {
+    ) -> Result<Self, TiledError> {
         let ((id, gid, n, t, w, h, v, r), (x, y)) = get_attrs!(
             attrs,
             optionals: [
@@ -852,15 +896,15 @@ impl Object {
                 Ok(())
             },
             "polyline" => |attrs| {
-                shape = Some(try!(Object::new_polyline(attrs)));
+                shape = Some(Self::new_polyline(attrs)?);
                 Ok(())
             },
             "polygon" => |attrs| {
-                shape = Some(try!(Object::new_polygon(attrs)));
+                shape = Some(Self::new_polygon(attrs)?);
                 Ok(())
             },
             "properties" => |_| {
-                properties = try!(parse_properties(parser));
+                properties = parse_properties(factory, parser)?;
                 Ok(())
             },
         });
@@ -870,7 +914,7 @@ impl Object {
             height: h,
         });
 
-        Ok(Object {
+        Ok(Self {
             id: id,
             gid: gid,
             name: n.clone(),
@@ -893,7 +937,7 @@ impl Object {
             ],
             TiledError::MalformedAttributes("A polyline must have points".to_string())
         );
-        let points = try!(Object::parse_points(s));
+        let points = try!(Self::parse_points(s));
         Ok(ObjectShape::Polyline { points: points })
     }
 
@@ -906,7 +950,7 @@ impl Object {
             ],
             TiledError::MalformedAttributes("A polygon must have points".to_string())
         );
-        let points = try!(Object::parse_points(s));
+        let points = Self::parse_points(s)?;
         Ok(ObjectShape::Polygon { points: points })
     }
 
@@ -1099,7 +1143,7 @@ fn convert_to_u32(all: &Vec<u8>, width: u32) -> Vec<Vec<u32>> {
     data
 }
 
-fn parse_impl<R: Read>(reader: R, map_path: Option<&Path>) -> Result<Map, TiledError> {
+fn parse_impl<C: Context, R: Read>(factory: &impl Factory<C>, reader: R, map_path: Option<&Path>) -> Result<Map<C>, TiledError> {
     let mut parser = EventReader::new(reader);
     loop {
         match try!(parser.next().map_err(TiledError::XmlDecodingError)) {
@@ -1107,7 +1151,7 @@ fn parse_impl<R: Read>(reader: R, map_path: Option<&Path>) -> Result<Map, TiledE
                 name, attributes, ..
             } => {
                 if name.local_name == "map" {
-                    return Map::new(&mut parser, attributes, map_path);
+                    return Map::new(factory, &mut parser, attributes, map_path);
                 }
             }
             XmlEvent::EndDocument => {
@@ -1120,27 +1164,70 @@ fn parse_impl<R: Read>(reader: R, map_path: Option<&Path>) -> Result<Map, TiledE
     }
 }
 
+/// A context used for reading Tiled `.tmx` and `.ts` files in the same style as tiled 0.8.0:
+/// * Tilesets will be immediately loaded, syncronously
+/// * Images will *not* be loaded, but remain referenced by String s.
+/// * Files referenced by properties will *not* be loaded, but remain referenced by String s.
+#[derive(Debug, PartialEq, Clone)]
+pub struct LegacyContext;
+
+impl Context for LegacyContext {
+    type ImageRef           = String;
+    type PropertyFileRef    = String;
+    type TilesetDataRef     = TilesetData<Self>;
+}
+
+/// Loads files directly from the filesystem with no sandboxing, nor other restrictions.  This is not particularly safe!
+/// If you load User Generated Content or other naughty content, you're at least vulnerable to DoS attacks in the form
+/// of intentionally loading more files than you have RAM for, or leaking personal data by loading files the game has no
+/// business accessing (`/etc/passwd`?  Chrome's unencrypted equivalent?  Use your imagination!)
+pub struct NoSandboxFilesystem;
+
+impl Factory<LegacyContext> for NoSandboxFilesystem {
+    fn image_ref(&self, path: String) -> Result<String, TiledError> {
+        Ok(path)
+    }
+
+    fn external_tileset_ref(&self, path: PathBuf) -> Result<TilesetData<LegacyContext>, TiledError> {
+        let file = File::open(&path).map_err(|_| {
+            TiledError::Other(format!(
+                "External tileset file not found: {:?}",
+                path
+            ))
+        })?;
+        TilesetData::new_external(self, file)
+    }
+
+    fn embed_tileset(&self, embedded: TilesetData<LegacyContext>) -> Result<TilesetData<LegacyContext>, TiledError> {
+        Ok(embedded)
+    }
+
+    fn property_file_ref(&self, path: String) -> Result<String, TiledError> {
+        Ok(path)
+    }
+}
+
 /// Parse a buffer hopefully containing the contents of a Tiled file and try to
 /// parse it. This augments `parse` with a file location: some engines
 /// (e.g. Amethyst) simply hand over a byte stream (and file location) for parsing,
 /// in which case this function may be required.
-pub fn parse_with_path<R: Read>(reader: R, path: &Path) -> Result<Map, TiledError> {
-    parse_impl(reader, Some(path))
+pub fn parse_with_path<R: Read>(reader: R, path: &Path) -> Result<Map<LegacyContext>, TiledError> {
+    parse_impl(&NoSandboxFilesystem, reader, Some(path))
 }
 
 /// Parse a file hopefully containing a Tiled map and try to parse it.  If the
 /// file has an external tileset, the tileset file will be loaded using a path
 /// relative to the map file's path.
-pub fn parse_file(path: &Path) -> Result<Map, TiledError> {
+pub fn parse_file(path: &Path) -> Result<Map<LegacyContext>, TiledError> {
     let file = File::open(path)
         .map_err(|_| TiledError::Other(format!("Map file not found: {:?}", path)))?;
-    parse_impl(file, Some(path))
+    parse_impl(&NoSandboxFilesystem, file, Some(path))
 }
 
 /// Parse a buffer hopefully containing the contents of a Tiled file and try to
 /// parse it.
-pub fn parse<R: Read>(reader: R) -> Result<Map, TiledError> {
-    parse_impl(reader, None)
+pub fn parse<R: Read>(reader: R) -> Result<Map<LegacyContext>, TiledError> {
+    parse_impl(&NoSandboxFilesystem, reader, None)
 }
 
 /// Parse a buffer hopefully containing the contents of a Tiled tileset.
@@ -1148,6 +1235,15 @@ pub fn parse<R: Read>(reader: R) -> Result<Map, TiledError> {
 /// External tilesets do not have a firstgid attribute.  That lives in the
 /// map. You must pass in `first_gid`.  If you do not need to use gids for anything,
 /// passing in 1 will work fine.
-pub fn parse_tileset<R: Read>(reader: R, first_gid: u32) -> Result<Tileset, TiledError> {
-    Tileset::new_external(reader, first_gid)
+pub fn parse_tileset<R: Read>(reader: R, first_gid: u32) -> Result<Tileset<LegacyContext>, TiledError> {
+    Ok(Tileset { first_gid, data: TilesetData::new_external(&NoSandboxFilesystem, reader)? })
+}
+
+/// Parse a buffer hopefully containing the contents of a Tiled tileset.
+///
+/// External tilesets do not have a firstgid attribute.  That lives in the
+/// map. You must pass in `first_gid`.  If you do not need to use gids for anything,
+/// passing in 1 will work fine.
+pub fn parse_tileset_data<R: Read>(reader: R) -> Result<TilesetData<LegacyContext>, TiledError> {
+    TilesetData::new_external(&NoSandboxFilesystem, reader)
 }
